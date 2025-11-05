@@ -1,10 +1,12 @@
 CREATE TABLE IF NOT EXISTS personas(
-  dni CHAR(8) PRIMARY KEY,
-  apell_pat VARCHAR(50) NOT NULL,
-  apell_mat VARCHAR(50) NOT NULL,
-  nombres   VARCHAR(80) NOT NULL,
-  fecha_naci DATE NOT NULL,
-  sexo CHAR(1) CHECK (sexo IN ('M','F')),
-  direccion VARCHAR(120)
+  dni TEXT PRIMARY KEY,
+  apell_pat TEXT NOT NULL,
+  apell_mat TEXT NOT NULL,
+  nombres   TEXT NOT NULL,
+  fecha_naci TEXT NOT NULL,   -- 'YYYY-MM-DD'
+  sexo TEXT CHECK (sexo IN ('M','F')),
+  estado_civil TEXT NOT NULL,
+  lugar_nacimiento TEXT NOT NULL,
+  direccion TEXT
 );
 

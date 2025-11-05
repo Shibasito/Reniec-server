@@ -89,6 +89,8 @@ public class RabbitReniecServer implements AutoCloseable {
         person.put("nombres", p.nombres());
         person.put("fecha_naci", p.fechaNaci());
         person.put("sexo", p.sexo());
+        person.put("estado_civil", p.estadoCivil());           
+        person.put("lugar_nacimiento", p.lugarNacimiento());   
         person.put("direccion", p.direccion());
 
         out.put("ok", true);

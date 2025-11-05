@@ -5,7 +5,9 @@ public record Person(
     String apellPat,
     String apellMat,
     String nombres,
-    String fechaNaci, // yyyy-MM-dd
+    String fechaNaci,       // yyyy-MM-dd
     String sexo,
+    String estadoCivil,     
+    String lugarNacimiento, 
     String direccion
 ) {}
