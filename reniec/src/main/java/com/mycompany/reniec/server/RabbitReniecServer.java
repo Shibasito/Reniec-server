@@ -1,11 +1,9 @@
 package com.mycompany.reniec.server;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.rabbitmq.client.*;
-import com.mycompany.reniec.server.Person;
-import com.mycompany.reniec.server.ReniecService;
-import com.mycompany.reniec.server.Env;
 
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
@@ -53,12 +51,13 @@ public class RabbitReniecServer implements AutoCloseable {
       String corrId = props.getCorrelationId();
       String replyTo = props.getReplyTo();
 
-      var resp = handle(delivery.getBody());
+      String resp = handle(delivery.getBody());
       byte[] body = resp.getBytes(StandardCharsets.UTF_8);
 
-      // Publica respuesta RPC
+      // Publica respuesta RPC (default exchange → replyTo)
       AMQP.BasicProperties rProps = new AMQP.BasicProperties.Builder()
           .correlationId(corrId)
+          .contentType("application/json")
           .build();
       ch.basicPublish("", replyTo, rProps, body);
 
@@ -71,47 +70,66 @@ public class RabbitReniecServer implements AutoCloseable {
 
   private String handle(byte[] request) {
     try {
-      var node = om.readTree(new String(request, StandardCharsets.UTF_8));
-      String dni = node.path("dni").asText("");
+      JsonNode node = om.readTree(new String(request, StandardCharsets.UTF_8));
+      // Acepta dni tanto en la raíz como dentro de {data:{dni}} por compatibilidad
+      String dni = node.path("dni").asText(
+          node.path("data").path("dni").asText("")
+      );
 
       Person p = service.verifyPerson(dni);
 
       ObjectNode out = om.createObjectNode();
+
       if (p == null) {
-        out.put("ok", false);
-        out.putNull("person");
-        out.put("error", "NOT_FOUND");
-      } else {
-        ObjectNode person = om.createObjectNode();
-        person.put("dni", p.dni());
-        person.put("apell_pat", p.apellPat());
-        person.put("apell_mat", p.apellMat());
-        person.put("nombres", p.nombres());
-        person.put("fecha_naci", p.fechaNaci());
-        person.put("sexo", p.sexo());
-        person.put("estado_civil", p.estadoCivil());           
-        person.put("lugar_nacimiento", p.lugarNacimiento());   
-        person.put("direccion", p.direccion());
+        // Formato que el bank entiende: ok=true + data.valid=false
+        ObjectNode data = om.createObjectNode();
+        data.put("valid", false);
+        data.put("dni", dni);
 
         out.put("ok", true);
-        out.set("person", person);
+        out.set("data", data);
+        out.putNull("person");   // alias opcional
+        out.putNull("error");
+      } else {
+        // ok=true + data.valid=true con los campos que usa el bank
+        ObjectNode data = om.createObjectNode();
+        data.put("valid", true);
+        data.put("dni", p.dni());
+        data.put("nombres", p.nombres());
+        data.put("apellidoPat", p.apellPat());
+        data.put("apellidoMat", p.apellMat());
+
+        // (Opcional) Campos adicionales del Person si quieres exponerlos
+        if (p.estadoCivil() != null) data.put("estado_civil", p.estadoCivil());
+        if (p.lugarNacimiento() != null) data.put("lugar_nacimiento", p.lugarNacimiento());
+        if (p.direccion() != null) data.put("direccion", p.direccion());
+
+        out.put("ok", true);
+        out.set("data", data);   // <- lo que el bank realmente consume
+        out.set("person", data); // <- alias por compatibilidad
         out.putNull("error");
       }
+
       return om.writeValueAsString(out);
+
     } catch (Exception e) {
+      // Errores reales de procesamiento → ok=false con mensaje
       try {
         ObjectNode out = om.createObjectNode();
         out.put("ok", false);
         out.putNull("person");
-        out.put("error", e.getMessage());
+        ObjectNode err = om.createObjectNode();
+        err.put("message", e.getMessage());
+        out.set("error", err);
         return om.writeValueAsString(out);
       } catch (Exception ignored) {
-        return "{\"ok\":false,\"person\":null,\"error\":\"SERIALIZATION_ERROR\"}";
+        return "{\"ok\":false,\"person\":null,\"error\":{\"message\":\"SERIALIZATION_ERROR\"}}";
       }
     }
   }
 
-  @Override public void close() throws Exception {
+  @Override
+  public void close() throws Exception {
     try { if (ch != null && ch.isOpen()) ch.close(); }
     finally { if (conn != null && conn.isOpen()) conn.close(); }
   }

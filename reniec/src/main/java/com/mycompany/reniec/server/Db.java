@@ -2,136 +2,281 @@ package com.mycompany.reniec.server;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import java.util.regex.Pattern;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.sql.*;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 
-public class Db implements AutoCloseable {
+/**
+ * Db (RENIEC)
+ * -----------
+ * Adaptador de base de datos con:
+ *  - JDBC genérico vía HikariCP (PostgreSQL / MySQL / SQLite).
+ *  - Bootstrap automático de schema/seed al primer arranque.
+ *  - Método de dominio: findByDni(String).
+ *
+ * Configuración (Env → primero ENV, luego application.properties):
+ *  - DB_JDBC_URL   : p.ej. jdbc:postgresql://localhost:5432/reniec
+ *  - DB_USERNAME   : usuario (pgsql/mysql)
+ *  - DB_PASSWORD   : contraseña (pgsql/mysql)
+ *  - DB_POOL_SIZE  : default 4
+ *
+ * Compatibilidad local (si no defines DB_JDBC_URL):
+ *  - DB_SQLITE_URL : p.ej. jdbc:sqlite:data/reniec.db
+ */
+public final class Db implements AutoCloseable {
+
   private final HikariDataSource ds;
 
-    public Db() throws Exception {
-      String url = Env.get("DB_SQLITE_URL", "jdbc:sqlite:./data/reniec.db");
-      ensureSqliteDir(url);                      // <-- AÑADE ESTA LÍNEA
+  public Db() throws Exception {
+    // 1) Resolver URL: si no hay DB_JDBC_URL, caer a SQLite local
+    String jdbcUrl = Env.get("DB_JDBC_URL", null);
+    if (jdbcUrl == null || jdbcUrl.isBlank()) {
+      jdbcUrl = Env.get("DB_SQLITE_URL", "jdbc:sqlite:data/reniec.db");
+    }
 
-      int pool = Env.getInt("DB_POOL_SIZE", 4);
+    // 2) Configurar Hikari
+    HikariConfig cfg = new HikariConfig();
+    cfg.setJdbcUrl(jdbcUrl);
+    cfg.setMaximumPoolSize(Env.getInt("DB_POOL_SIZE", 4));
+    cfg.setAutoCommit(false);
 
-      HikariConfig cfg = new HikariConfig();
-      cfg.setJdbcUrl(url);
-      cfg.setMaximumPoolSize(pool);
-      cfg.setMinimumIdle(1);
-      cfg.setAutoCommit(true);
-      // cfg.setDriverClassName("org.sqlite.JDBC"); // opcional
-      this.ds = new HikariDataSource(cfg);
+    // Usuario/clave solo si aplica
+    if (jdbcUrl.startsWith("jdbc:postgresql:")
+        || jdbcUrl.startsWith("jdbc:mysql:")
+        || jdbcUrl.startsWith("jdbc:mariadb:")) {
+      cfg.setUsername(Env.get("DB_USERNAME", "reniec"));
+      cfg.setPassword(Env.get("DB_PASSWORD", "reniec"));
+    }
 
-      try (Connection c = ds.getConnection(); Statement st = c.createStatement()) {
-        st.execute("PRAGMA journal_mode=WAL");
-        st.execute("PRAGMA synchronous=NORMAL");
-      }
-      initIfNeeded();
+    // Asegurar carpeta del archivo SQLite si corresponde
+    if (jdbcUrl.startsWith("jdbc:sqlite:")) {
+      ensureSqliteDir(jdbcUrl);
     }
     
-    private static void ensureSqliteDir(String jdbcUrl) throws Exception {
-        if (jdbcUrl == null || !jdbcUrl.startsWith("jdbc:sqlite:")) return;
+    // ==================== DIAGNÓSTICO DB (INICIO) ====================
+    String envUrl  = System.getenv("DB_JDBC_URL");
+    String envUser = System.getenv("DB_USERNAME");
+    String envPass = System.getenv("DB_PASSWORD");
 
-        String path = jdbcUrl.substring("jdbc:sqlite:".length());
-        // ignora memoria
-        if (":memory:".equals(path) || path.startsWith("file:")) return;
-
-        Path dbPath = Paths.get(path).toAbsolutePath();
-        Path dir = dbPath.getParent();
-        if (dir != null && !Files.exists(dir)) {
-          Files.createDirectories(dir);
-      }
+    String effUrl  = Env.get("DB_JDBC_URL", null);
+    if (effUrl == null || effUrl.isBlank()) {
+        effUrl = Env.get("DB_SQLITE_URL", "jdbc:sqlite:data/reniec.db");
     }
+    String effUser = Env.get("DB_USERNAME", null);
+    String effPass = Env.get("DB_PASSWORD", null);
 
-  private void initIfNeeded() throws Exception {
-    if (!tableExists("personas")) {
-      System.out.println("[DB] Inicializando BD (schema + seed)...");
-      execSqlResource("com/mycompany/reniec/Resources/db/schema.sql");
-      execSqlResource("com/mycompany/reniec/Resources/db/seed.sql");
-      System.out.println("[DB] Inicialización completada.");
-    }
-  }
+    System.out.println("========== [DB DEBUG] ==========");
+    System.out.println("[DB] cwd=" + System.getProperty("user.dir"));
+    System.out.println("[DB] RAW ENV      url=" + envUrl + "  user=" + envUser + "  pass=" + envPass);
+    System.out.println("[DB] Env.get()    url=" + effUrl + "  user=" + effUser + "  pass=" + effPass);
 
-  private boolean tableExists(String table) throws Exception {
-    final String sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-    try (Connection c = ds.getConnection();
-         PreparedStatement ps = c.prepareStatement(sql)) {
-      ps.setString(1, table);
-      try (ResultSet rs = ps.executeQuery()) {
-        return rs.next();
-      }
-    }
-  }
-
-  private void execSqlResource(String resourcePath) throws Exception {
-    List<String> statements = loadSqlStatements(resourcePath);
-    try (Connection c = ds.getConnection()) {
-      for (String s : statements) {
-        try (Statement st = c.createStatement()) {
-          st.execute(s);
+    try {
+        if (effUrl != null && effUrl.startsWith("jdbc:postgresql:")) {
+            String after = effUrl.substring("jdbc:postgresql://".length());
+            String hostPort = after.contains("/") ? after.substring(0, after.indexOf('/')) : after;
+            System.out.println("[DB] JDBC PG hostPort=" + hostPort + " (esperado 127.0.0.1:5432 o postgres:5432)");
+        } else if (effUrl != null && effUrl.startsWith("jdbc:sqlite:")) {
+            System.out.println("[DB] JDBC SQLite path=" + effUrl.substring("jdbc:sqlite:".length()));
         }
+    } catch (Exception ignore) {}
+
+    System.out.println("[DB] Hikari config about to init ...");
+    System.out.println("=================================");
+    // ==================== DIAGNÓSTICO DB (FIN) =======================
+
+
+    this.ds = new HikariDataSource(cfg);
+
+    // 3) Bootstrap: crear tablas y seed si no existe la principal
+    try (Connection c = get()) {
+      if (!tableExists(c, "personas")) {
+        runSqlResource(c, "/com/mycompany/reniec/Resources/db/schema.sql");
+        runSqlResource(c, "/com/mycompany/reniec/Resources/db/seed.sql");
+        c.commit();
+      } else {
+        c.rollback();
       }
     }
   }
 
-  private List<String> loadSqlStatements(String resourcePath) throws Exception {
-    List<String> out = new ArrayList<>();
-    InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(resourcePath);
-    if (in == null) throw new IllegalArgumentException("No se encontró recurso SQL: " + resourcePath);
-    try (BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-      StringBuilder sb = new StringBuilder();
-      String line;
-      while ((line = br.readLine()) != null) {
-        // Ignora líneas de comentario simples
-        if (line.trim().startsWith("--")) continue;
-        sb.append(line).append('\n');
-      }
-      for (String stmt : sb.toString().split(";")) {
-        String s = stmt.trim();
-        if (!s.isEmpty()) out.add(s);
-      }
-    }
-    return out;
+  /** Obtiene una conexión con autoCommit=false. */
+  public Connection get() throws SQLException {
+    Connection c = ds.getConnection();
+    c.setAutoCommit(false);
+    return c;
   }
 
-    public Person findByDni(String dni) throws Exception {
-      final String sql = """
-          SELECT dni, apell_pat, apell_mat, nombres, fecha_naci, sexo,
-                 estado_civil, lugar_nacimiento, direccion
-          FROM personas
-          WHERE dni = ?
-          """;
-      try (Connection c = ds.getConnection();
-           PreparedStatement ps = c.prepareStatement(sql)) {
+  @Override public void close() {
+    if (ds != null) ds.close();
+  }
+
+  // =====================================================================
+  // Dominio
+  // =====================================================================
+
+  /**
+   * Busca una persona por DNI. Devuelve null si no existe.
+   * Soporta:
+   *  - fecha_naci: DATE (pgsql/mysql) o TEXT (sqlite "YYYY-MM-DD")
+   *  - columnas opcionales: estado_civil, lugar_nacimiento
+   */
+  public Person findByDni(String dni) throws Exception {
+    if (dni == null || dni.isBlank()) return null;
+
+    final String sql = "SELECT * FROM personas WHERE dni = ?";
+
+    try (Connection c = get()) {
+      c.setReadOnly(true);
+      try (PreparedStatement ps = c.prepareStatement(sql)) {
         ps.setString(1, dni);
         try (ResultSet rs = ps.executeQuery()) {
-          if (!rs.next()) return null;
+          if (!rs.next()) {
+            c.rollback(); // limpiar transacción antes de devolver
+            return null;
+          }
+
+          // Campos base (siempre presentes en tu schema.sql)
+          String _dni        = rs.getString("dni");
+          String apellPat    = rs.getString("apell_pat");
+          String apellMat    = rs.getString("apell_mat");
+          String nombres     = rs.getString("nombres");
+
+          // fecha_naci puede ser DATE (pgsql) o TEXT (sqlite)
+          String fechaNaci;
+          try {
+            Date d = rs.getDate("fecha_naci");
+            fechaNaci = (d != null) ? d.toLocalDate().toString() : null;
+          } catch (SQLException ignore) {
+            fechaNaci = rs.getString("fecha_naci");
+          }
+
+          String sexo        = safeGet(rs, "sexo");
+          String direccion   = safeGet(rs, "direccion");
+
+          // Opcionales (si existen en la tabla)
+          String estadoCivil     = safeGet(rs, "estado_civil");
+          String lugarNacimiento = safeGet(rs, "lugar_nacimiento");
+
+          c.rollback(); // SELECT: no dejamos transacción abierta en el pool
+
           return new Person(
-              safe(rs.getString("dni")),
-              safe(rs.getString("apell_pat")),
-              safe(rs.getString("apell_mat")),
-              safe(rs.getString("nombres")),
-              safe(rs.getString("fecha_naci")),
-              safe(rs.getString("sexo")),
-              safe(rs.getString("estado_civil")),      
-              safe(rs.getString("lugar_nacimiento")),  
-              safe(rs.getString("direccion"))
+              _dni,
+              apellPat,
+              apellMat,
+              nombres,
+              fechaNaci,
+              sexo,
+              direccion,
+              estadoCivil,
+              lugarNacimiento
           );
         }
       }
     }
+  }
 
+  // =====================================================================
+  // Helpers internos
+  // =====================================================================
 
-  private static String safe(String s) { return s == null ? "" : s; }
+  /** Si es SQLite archivo, crea el directorio contenedor. */
+  private static void ensureSqliteDir(String sqliteUrl) {
+    String path = sqliteUrl.substring("jdbc:sqlite:".length()).trim();
+    if (":memory:".equals(path)) return;
+    Path p = Paths.get(path).toAbsolutePath();
+    Path dir = p.getParent();
+    if (dir != null) {
+      try { Files.createDirectories(dir); } catch (Exception ignored) {}
+    }
+  }
 
-  @Override public void close() { if (ds != null) ds.close(); }
+  /**
+   * Chequea existencia de tabla usando metadata (portable).
+   * Intenta sin schema y con "public" para Postgres, en mayúsc/minúsc.
+   */
+  private static boolean tableExists(Connection c, String tableName) throws SQLException {
+    DatabaseMetaData md = c.getMetaData();
+    String[] types = { "TABLE" };
+    if (existsIn(md, null, null, tableName, types)) return true;
+    if (existsIn(md, null, null, tableName.toUpperCase(), types)) return true;
+    if (existsIn(md, null, null, tableName.toLowerCase(), types)) return true;
+    if (existsIn(md, null, "public", tableName, types)) return true;
+    if (existsIn(md, null, "public", tableName.toUpperCase(), types)) return true;
+    if (existsIn(md, null, "public", tableName.toLowerCase(), types)) return true;
+    return false;
+  }
+
+  private static boolean existsIn(DatabaseMetaData md, String catalog, String schema, String table, String[] types) throws SQLException {
+    try (ResultSet rs = md.getTables(catalog, schema, table, types)) {
+      return rs.next();
+    }
+  }
+
+  /** Ejecuta un script SQL del classpath (split por ';'). */
+  private static void runSqlResource(Connection c, String resourcePath) throws Exception {
+    String script = loadResourceAsString(resourcePath);
+    for (String stmt : splitSqlStatements(script)) {
+      try (Statement s = c.createStatement()) {
+        s.executeUpdate(stmt);
+      }
+    }
+  }
+
+  private static String loadResourceAsString(String resourcePath) throws Exception {
+    try (InputStream in = Db.class.getResourceAsStream(resourcePath)) {
+      if (in == null) throw new IllegalArgumentException("Recurso no encontrado: " + resourcePath);
+      try (BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = br.readLine()) != null) sb.append(line).append('\n');
+        return sb.toString();
+      }
+    }
+  }
+
+  /** Split ingenuo por ';' fuera de cadenas, suficiente para nuestros scripts. */
+  private static List<String> splitSqlStatements(String script) {
+    List<String> out = new ArrayList<>();
+    if (script == null) return out;
+
+    boolean inString = false;
+    char quoteChar = 0;
+    StringBuilder cur = new StringBuilder();
+
+    for (int i = 0; i < script.length(); i++) {
+      char ch = script.charAt(i);
+      if (!inString && (ch == '\'' || ch == '"')) {
+        inString = true; quoteChar = ch; cur.append(ch);
+      } else if (inString && ch == quoteChar) {
+        inString = false; quoteChar = 0; cur.append(ch);
+      } else if (!inString && ch == ';') {
+        String stmt = cur.toString().trim();
+        if (!stmt.isEmpty()) out.add(stmt + ";");
+        cur.setLength(0);
+      } else {
+        cur.append(ch);
+      }
+    }
+    String tail = cur.toString().trim();
+    if (!tail.isEmpty()) out.add(tail);
+    return out;
+  }
+
+  /** Lee una columna String si existe; si no existe, devuelve null. */
+  private static String safeGet(ResultSet rs, String col) {
+    try {
+      rs.findColumn(col);
+      return rs.getString(col);
+    } catch (SQLException ignore) {
+      return null;
+    }
+  }
 }
+

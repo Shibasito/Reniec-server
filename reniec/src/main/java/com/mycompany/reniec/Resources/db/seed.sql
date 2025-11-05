@@ -1,7 +1,8 @@
-INSERT OR IGNORE INTO personas
-(dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, estado_civil, lugar_nacimiento, direccion) VALUES
-('45678912','GARCÍA','FLORES','MARÍA ELENA','1990-07-15','F','SOLTERO','Lima','Universitaria 1234'),
-('78901234','RAMÍREZ','QUISPE','JUAN CARLOS','1985-03-22','M','CASADO','Cusco','San Martín 456'),
-('12345678','TORRES','MENDOZA','LUIS ALBERTO','1992-11-05','M','SOLTERO','Arequipa','Sacsayhuamán 789'),
-('23456789','CHÁVEZ','ROJAS','ANA SOFÍA','1998-06-30','F','SOLTERO','Huancayo','Huancayo 321'),
-('34567890','PÉREZ','VÁSQUEZ','CARLOS JUAN','1979-12-10','M','CASADO','Trujillo','Las Palmeras 101');
+INSERT INTO personas (dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion)
+VALUES
+('12345678','TORRES','MENDOZA','LUIS ALBERTO','1992-11-05','M','Sacsayhuamán 789'),
+('23456789','PEREZ','GOMEZ','ANA MARIA','1990-03-12','F','Jr. Cusco 123'),
+('34567890','ROJAS','SALAZAR','CARLOS','1985-07-21','M','Av. Arequipa 456'),
+('45678912','GARCIA','FLORES','MARIA ELENA','1993-01-10','F','Av. Universitaria 1234'),
+('78901234','RAMIREZ','QUISPE','JUAN CARLOS','1988-12-30','M','Av. La Molina 5678')
+ON CONFLICT (dni) DO NOTHING;
