@@ -113,7 +113,17 @@ def init_db(conn):
             INSERT INTO personas (dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion)
             VALUES
             ('12345678','TORRES','MENDOZA','LUIS ALBERTO','1992-11-05','M','Sacsayhuamán 789'),
-            ('23456789','PEREZ','GOMEZ','ANA MARIA','1990-03-12','F','Jr. Cusco 123')
+            ('23456789','PEREZ','GOMEZ','ANA MARIA','1990-03-12','F','Jr. Cusco 123'),
+            ('34567890','QUISPE','HUAMAN','JOSE CARLOS','1988-01-20','M','Av. Grau 456'),
+            ('45678901','RAMIREZ','LOPEZ','MARIA ELENA','1995-07-08','F','Av. Arequipa 1020'),
+            ('56789012','ROJAS','SALAZAR','CARLOS ANDRÉS','1993-05-17','M','Jr. Junín 321'),
+            ('67890123','FLORES','CASTILLO','KAREN LUCÍA','1998-11-30','F','Psje. Libertad 55'),
+            ('78901234','DIAZ','PALOMINO','SERGIO ARTURO','1987-02-14','M','Calle Los Olivos 12'),
+            ('89012345','GARCIA','MORI','NATALIA SOFÍA','1999-09-22','F','Av. La Marina 200'),
+            ('90123457','CHÁVEZ','RIVAS','FRANCISCO JAVIER','1991-04-03','M','Jr. Tarapacá 88'),
+            ('01234568','MENDOZA','CRUZ','VALERIA PAOLA','2000-12-01','F','Malecón Balta 300'),
+            ('11223344','SANCHEZ','ARIAS','EDUARDO MANUEL','1994-06-15','M','Calle Colmena 17'),
+            ('55667788','AGUILAR','VERA','ANDREA NICOLE','1996-10-05','F','Jr. Puno 740')
             ON CONFLICT (dni) DO NOTHING;
         """)
         
