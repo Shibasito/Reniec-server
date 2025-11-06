@@ -1,0 +1,3 @@
+pika
+psycopg[binary]
+python-dotenv

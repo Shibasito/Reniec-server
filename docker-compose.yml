@@ -9,5 +9,35 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reniec"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  reniec-server:
+    build: .
+    environment:
+      # Postgres local de ESTE compose
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: reniec
+      PGPASSWORD: reniec
+      PGDATABASE: reniec
+      # RabbitMQ del middleware (en tu host)
+      RABBIT_HOST: host.docker.internal
+      RABBIT_PORT: 5672
+      RABBIT_USERNAME: admin
+      RABBIT_PASSWORD: admin
+      RABBIT_VHOST: /
+      RABBIT_EXCHANGE: rabbit_exchange
+      RABBIT_RENIEC_QUEUE: reniec_queue
+      RABBIT_RENIEC_ROUTING: reniec_operation
+      RABBIT_PREFETCH: 8
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
