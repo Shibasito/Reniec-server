@@ -1,63 +1,57 @@
 #!/usr/bin/env python3
-# reniec_server.py
-# Servicio RENIEC en Python (LP2) – RabbitMQ + PostgreSQL
+# reniec_server.py — Servicio RENIEC (RabbitMQ + PostgreSQL)
 #
-# - Consume de:   exchange = "rabbit_exchange" (direct)
-#                 queue    = "reniec_queue"
-#                 routing  = "reniec_operation"
-# - Responde a:   default exchange "" hacia properties.reply_to
-#                 (manteniendo correlation_id)
-# - Formato de salida compatible con bank-server:
-#     { "ok": true, "data": { "valid": true|false, "dni": "...",
-#                              "nombres": "...", "apellidoPat": "...", "apellidoMat": "..." } }
+# Consume:
+#   exchange: rabbit_exchange (direct)
+#   queue   : reniec_queue
+#   routing : reniec_operation
 #
-# Requisitos (pip):
+# Responde:
+#   al default exchange "" usando properties.reply_to (mismo correlation_id)
+#
+# Respuesta compatible con bank-server:
+#   { "ok": true, "data": { "valid": true|false, "dni": "...",
+#                           "nombres": "...", "apellidoPat": "...", "apellidoMat": "..." } }
+#
+# Requisitos:
 #   pip install pika psycopg[binary]
 #
-# Variables de entorno útiles:
+# AMQP ENV:
 #   RABBIT_HOST=localhost
 #   RABBIT_PORT=5672
 #   RABBIT_USERNAME=admin
 #   RABBIT_PASSWORD=admin
-#   RABBIT_VHOST=/            (opcional)
+#   RABBIT_VHOST=/
 #   RABBIT_EXCHANGE=rabbit_exchange
 #   RABBIT_RENIEC_QUEUE=reniec_queue
 #   RABBIT_RENIEC_ROUTING=reniec_operation
 #
-#   PGHOST=127.0.0.1
-#   PGPORT=5432
-#   PGUSER=reniec
-#   PGPASSWORD=reniec
-#   PGDATABASE=reniec
-#   # o bien:
+# DB ENV:
 #   PG_DSN=postgresql://reniec:reniec@127.0.0.1:5432/reniec?sslmode=disable
+#   (o componentes:)
+#   PGHOST=127.0.0.1  PGPORT=5432  PGUSER=reniec  PGPASSWORD=reniec  PGDATABASE=reniec
 #
-# Esquema esperado (PostgreSQL):
-#   CREATE TABLE personas (
-#     dni VARCHAR(8) PRIMARY KEY,
-#     apell_pat TEXT NOT NULL,
-#     apell_mat TEXT NOT NULL,
-#     nombres   TEXT NOT NULL,
-#     fecha_naci DATE,
-#     sexo CHAR(1),
-#     direccion TEXT,
-#     estado_civil TEXT,
-#     lugar_nacimiento TEXT
-#   );
+# Seed/Schema ENV:
+#   RENIEC_INIT_SCHEMA=1         # crea tabla si no existe
+#   RENIEC_SEED_ENABLE=1         # activa el poblado de datos
+#   RENIEC_SEED_BASE=10000000    # primer DNI del seed masivo
+#   RENIEC_SEED_COUNT=10000      # cuántos DNIs generar (contiguos)
+#
+# Nota clave en este update:
+#   - Forzamos el DNI recibido a string y lo normalizamos para evitar fallos
+#     cuando el productor lo envía numérico (sin comillas).
 
 import json
 import os
 import signal
 import sys
-import time
 from typing import Optional, Dict
 
 import pika
 import psycopg
 
-
 # -------------------------
-# Config
+# Config AMQP
 # -------------------------
 RABBIT_HOST = os.getenv("RABBIT_HOST", "localhost")
 RABBIT_PORT = int(os.getenv("RABBIT_PORT", "5672"))
@@ -68,8 +62,11 @@ RABBIT_VHOST = os.getenv("RABBIT_VHOST", "/")
 EXCHANGE = os.getenv("RABBIT_EXCHANGE", "rabbit_exchange")
 RENIEC_QUEUE = os.getenv("RABBIT_RENIEC_QUEUE", "reniec_queue")
 RENIEC_ROUTING = os.getenv("RABBIT_RENIEC_ROUTING", "reniec_operation")
+PREFETCH = int(os.getenv("RABBIT_PREFETCH", "8"))
 
-# DB por DSN (si existe) o por componentes PG*
+# -------------------------
+# Config DB
+# -------------------------
 PG_DSN = os.getenv("PG_DSN")
 if not PG_DSN:
     PGHOST = os.getenv("PGHOST", "127.0.0.1")
@@ -79,21 +76,26 @@ if not PG_DSN:
     PGDATABASE = os.getenv("PGDATABASE", "reniec")
     PG_DSN = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDATABASE}?sslmode=disable"
 
-# Prefetch básico para RPC
-PREFETCH = int(os.getenv("RABBIT_PREFETCH", "8"))
+# -------------------------
+# Config Schema/Seed
+# -------------------------
+INIT_SCHEMA = os.getenv("RENIEC_INIT_SCHEMA", "1") == "1"
+SEED_ENABLE = os.getenv("RENIEC_SEED_ENABLE", "1") == "1"
+SEED_BASE = int(os.getenv("RENIEC_SEED_BASE", "10000000"))     # primer DNI del seed masivo
+SEED_COUNT = int(os.getenv("RENIEC_SEED_COUNT", "10000"))      # cuántos DNIs insertar
 
 # -------------------------
 # DB helpers
 # -------------------------
 def open_db():
-    # psycopg3 – connection única (Blocking), autocommit OFF; haremos solo SELECT.
+    # psycopg3 — conexión bloqueante
     conn = psycopg.connect(PG_DSN, autocommit=False)
     return conn
 
-def init_db(conn):
-    """Crea tabla e inserta datos iniciales si no existen"""
+def ensure_schema(conn):
+    if not INIT_SCHEMA:
+        return
     with conn.cursor() as cur:
-        # Crear tabla
         cur.execute("""
             CREATE TABLE IF NOT EXISTS personas (
               dni              VARCHAR(8) PRIMARY KEY,
@@ -107,43 +109,99 @@ def init_db(conn):
               lugar_nacimiento TEXT
             );
         """)
-        
-        # Insertar datos de prueba
+    conn.commit()
+
+def seed_db(conn):
+    if not SEED_ENABLE:
+        return
+    with conn.cursor() as cur:
+        # 1) Semilla fija con UPSERT (asegura que siempre existan con estos datos)
         cur.execute("""
-            INSERT INTO personas (dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion)
+            INSERT INTO personas
+              (dni, apell_pat, apell_mat, nombres, fecha_naci, sexo,
+               direccion, estado_civil, lugar_nacimiento)
             VALUES
-            ('12345678','TORRES','MENDOZA','LUIS ALBERTO','1992-11-05','M','Sacsayhuamán 789'),
-            ('23456789','PEREZ','GOMEZ','ANA MARIA','1990-03-12','F','Jr. Cusco 123'),
-            ('34567890','QUISPE','HUAMAN','JOSE CARLOS','1988-01-20','M','Av. Grau 456'),
-            ('45678901','RAMIREZ','LOPEZ','MARIA ELENA','1995-07-08','F','Av. Arequipa 1020'),
-            ('56789012','ROJAS','SALAZAR','CARLOS ANDRÉS','1993-05-17','M','Jr. Junín 321'),
-            ('67890123','FLORES','CASTILLO','KAREN LUCÍA','1998-11-30','F','Psje. Libertad 55'),
-            ('78901234','DIAZ','PALOMINO','SERGIO ARTURO','1987-02-14','M','Calle Los Olivos 12'),
-            ('89012345','GARCIA','MORI','NATALIA SOFÍA','1999-09-22','F','Av. La Marina 200'),
-            ('90123457','CHÁVEZ','RIVAS','FRANCISCO JAVIER','1991-04-03','M','Jr. Tarapacá 88'),
-            ('01234568','MENDOZA','CRUZ','VALERIA PAOLA','2000-12-01','F','Malecón Balta 300'),
-            ('11223344','SANCHEZ','ARIAS','EDUARDO MANUEL','1994-06-15','M','Calle Colmena 17'),
-            ('55667788','AGUILAR','VERA','ANDREA NICOLE','1996-10-05','F','Jr. Puno 740')
+              ('12345678','TORRES','MENDOZA','LUIS ALBERTO','1992-11-05','M','Sacsayhuamán 789','Casado','Lima'),
+              ('23456789','PEREZ','GOMEZ','ANA MARIA','1990-03-12','F','Jr. Cusco 123','Soltera','Cusco'),
+              ('34567890','RAMIREZ','LOPEZ','CARLOS ANDRÉS','1988-07-15','M','Av. Arequipa 456','Soltero','Lima'),
+              ('45678901','FLORES','HUAMAN','MARÍA ELENA','1995-02-28','F','Jr. Amazonas 987','Soltera','Arequipa'),
+              ('56789012','GARCIA','SALAZAR','JORGE LUIS','1998-09-10','M','Av. Los Héroes 320','Soltero','Arequipa'),
+              ('67890123','ROJAS','QUISPE','LUCÍA FERNANDA','2000-05-21','F','Calle Lima 221','Soltera','Puno'),
+              ('78901234','DIAZ','RAMOS','PEDRO MIGUEL','1985-12-03','M','Jr. Ayacucho 745','Casado','Trujillo')
+            ON CONFLICT (dni) DO UPDATE
+            SET apell_pat        = EXCLUDED.apell_pat,
+                apell_mat        = EXCLUDED.apell_mat,
+                nombres          = EXCLUDED.nombres,
+                fecha_naci       = EXCLUDED.fecha_naci,
+                sexo             = EXCLUDED.sexo,
+                direccion        = EXCLUDED.direccion,
+                estado_civil     = EXCLUDED.estado_civil,
+                lugar_nacimiento = EXCLUDED.lugar_nacimiento;
+        """)
+
+        # 2) Semilla masiva parametrizable (no pisa los anteriores)
+        cur.execute(f"""
+            WITH s AS (
+                SELECT generate_series(0, {SEED_COUNT}-1) AS i
+            )
+            INSERT INTO personas (dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion)
+            SELECT
+                to_char({SEED_BASE} + i, 'FM00000000')       AS dni,
+                'APELLIDO' || i                               AS apell_pat,
+                'MATERNO' || i                                AS apell_mat,
+                'NOMBRE ' || i                                AS nombres,
+                DATE '1990-01-01' + (i % 10000)               AS fecha_naci,
+                CASE WHEN (i % 2) = 0 THEN 'M' ELSE 'F' END   AS sexo,
+                'CALLE ' || i                                 AS direccion
+            FROM s
             ON CONFLICT (dni) DO NOTHING;
         """)
-        
-        conn.commit()
-        print("[DB] Tabla 'personas' inicializada", flush=True)
+    conn.commit()
 
-def get_person(conn, dni: str) -> Optional[Dict]:
+
+def init_db(conn):
+    ensure_schema(conn)
+    seed_db(conn)
+    # Diagnóstico: contar filas y validar primer DNI del seed
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM personas;")
+        total = cur.fetchone()[0]
+        probe = f"{SEED_BASE:08d}"
+        cur.execute("SELECT 1 FROM personas WHERE dni = %s;", (probe,))
+        has_probe = cur.fetchone() is not None
+    print(f"[DB] personas={total}  probe({probe})={has_probe}", flush=True)
+
+def normalize_dni(value) -> Optional[str]:
     """
-    Devuelve un dict con los campos de la persona o None si no existe.
-    Mapea columnas a los nombres que el bank consume:
-      - apell_pat  -> apellidoPat
-      - apell_mat  -> apellidoMat
+    Convierte lo que venga (int/str/None) a un DNI string 8 dígitos si es válido.
     """
-    if not dni or len(dni) != 8 or not dni.isdigit():
+    if value is None:
         return None
-    sql = "SELECT dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion, estado_civil, lugar_nacimiento FROM personas WHERE dni = %s"
+    try:
+        s = str(value).strip()
+    except Exception:
+        return None
+    # eliminar espacios, comillas raras, etc.
+    s = "".join(ch for ch in s if ch.isdigit())
+    if len(s) == 8 and s.isdigit():
+        return s
+    return None
+
+def get_person(conn, dni_input) -> Optional[Dict]:
+    """
+    Devuelve dict con campos esperados por el bank o None si no existe/ inválido.
+    """
+    dni = normalize_dni(dni_input)
+    if not dni:
+        return None
+    sql = """
+        SELECT dni, apell_pat, apell_mat, nombres, fecha_naci, sexo, direccion, estado_civil, lugar_nacimiento
+        FROM personas WHERE dni = %s
+    """
     with conn.cursor() as cur:
         cur.execute(sql, (dni,))
         row = cur.fetchone()
-        conn.rollback()  # no dejamos transacción abierta
+        conn.rollback()
         if not row:
             return None
         (dni, ap_pat, ap_mat, nombres, fecha_naci, sexo, direccion, estado_civil, lugar_nacimiento) = row
@@ -153,7 +211,7 @@ def get_person(conn, dni: str) -> Optional[Dict]:
             "apellidoPat": ap_pat,
             "apellidoMat": ap_mat,
         }
-        # Campos opcionales, por si te sirven para debug/cliente
+        # opcionales para debug/cliente
         if fecha_naci is not None:
             out["fecha_naci"] = str(fecha_naci)
         if sexo is not None:
@@ -196,7 +254,7 @@ class ReniecRpcServer:
         self._ch = self._conn.channel()
         self._ch.basic_qos(prefetch_count=PREFETCH)
 
-        # Idempotente: por si el middleware aún no corrió
+        # Declaraciones idempotentes por si el middleware aún no levantó todo
         self._ch.exchange_declare(exchange=EXCHANGE, exchange_type="direct", durable=True)
         self._ch.queue_declare(queue=RENIEC_QUEUE, durable=True)
         self._ch.queue_bind(queue=RENIEC_QUEUE, exchange=EXCHANGE, routing_key=RENIEC_ROUTING)
@@ -211,36 +269,37 @@ class ReniecRpcServer:
             corr_id = getattr(props, "correlation_id", None)
             reply_to = getattr(props, "reply_to", None)
 
-            # Log entrada
             try:
                 preview = body.decode("utf-8", errors="replace")
             except Exception:
                 preview = "<binary>"
             print(f"[>] Received corr={corr_id} reply_to={reply_to} size={len(body)} body={preview}", flush=True)
 
-            # Parse request (acepta {"dni":"..."} o {"data":{"dni":"..."}})
+            # Parseo robusto: acepta {"dni": ...} o {"data":{"dni":...}} o {"payload":{"dni":...| "usuario":...}}
             dni = None
             try:
                 req = json.loads(preview)
-                dni = req.get("dni") or (req.get("data", {}) or {}).get("dni")
-            except Exception as e:
-                pass
+                raw_dni = (
+                    req.get("dni")
+                    or ((req.get("data") or {}) or {}).get("dni")
+                    or ((req.get("payload") or {}) or {}).get("dni")
+                    or ((req.get("payload") or {}) or {}).get("usuario")
+                )
+                dni = normalize_dni(raw_dni)
+            except Exception:
+                dni = None
 
             try:
                 person = get_person(self._db, dni) if dni else None
                 if person:
                     data = {"valid": True, **person}
                 else:
-                    data = {"valid": False, "dni": (dni or "")}
-
+                    data = {"valid": False, "dni": dni or ""}
                 resp = {"ok": True, "data": data}
             except Exception as e:
-                # Falla de DB u otra: ok=false
                 resp = {"ok": False, "data": None, "error": {"message": str(e)}}
 
             payload = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-
-            # Publica respuesta RPC al default exchange "" → reply_to
             props_out = pika.BasicProperties(
                 correlation_id=corr_id,
                 content_type="application/json",
@@ -248,7 +307,6 @@ class ReniecRpcServer:
 
             try:
                 if not reply_to:
-                    # No hay dónde responder; solo ack y log
                     print(f"[!] Missing reply_to; dropping response corr={corr_id}", flush=True)
                 else:
                     self._ch.basic_publish(
@@ -261,7 +319,7 @@ class ReniecRpcServer:
             finally:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
 
-            # Mantener DB saludable: si el cursor/conn muere, reabrimos en el próximo msg
+            # Ping DB; si muere, reabrimos
             try:
                 self._db.execute("SELECT 1;")
                 self._db.rollback()
@@ -306,11 +364,10 @@ class ReniecRpcServer:
 
 
 def main():
-    # Señales para cierre limpio (Docker/Unix)
-    server = ReniecRpcServer()
+    srv = ReniecRpcServer()
 
     def _sig_handler(signum, frame):
-        server.stop()
+        srv.stop()
         sys.exit(0)
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -318,7 +375,7 @@ def main():
         except Exception:
             pass
 
-    server.start()
+    srv.start()
 
 
 if __name__ == "__main__":

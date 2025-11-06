@@ -1,0 +1,22 @@
+services:
+  client-load:
+    build: .
+    environment:
+      RABBIT_HOST: host.docker.internal
+      RABBIT_PORT: 5672
+      RABBIT_USERNAME: admin
+      RABBIT_PASSWORD: admin
+      RABBIT_VHOST: /
+      RABBIT_EXCHANGE: rabbit_exchange
+      BANK_ROUTING: bank_operation
+
+      WORKERS: 20
+      CLIENTS_PER_WORKER: 60
+      TX_PER_CLIENT: 2
+      LOANS_PER_CLIENT: 1
+
+      CSV_PATH: /out/results.csv
+      PLOT_DIR: /out
+      PLOT_PREFIX: run1
+    volumes:
+      - ./load_out:/out
